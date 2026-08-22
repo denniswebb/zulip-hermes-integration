@@ -839,8 +839,10 @@ class ZulipAdapter(BasePlatformAdapter):
 
                 if events.get("result") == "error":
                     msg = events.get("msg", "")
+                    code = events.get("code")
                     is_bad_queue = (
-                        events.get("code") == "BAD_EVENT_QUEUE_ID"
+                        code == "BAD_EVENT_QUEUE_ID"
+                        or (code == "BAD_REQUEST" and "event newer than" in msg.lower() and "pruned" in msg.lower())
                         or "bad event queue" in msg.lower()
                     )
                     if is_bad_queue:
