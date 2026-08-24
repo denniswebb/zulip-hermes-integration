@@ -1748,6 +1748,11 @@ def register(ctx):
         env_enablement_fn=_env_enablement,
         allowed_users_env="ZULIP_ALLOWED_USERS",
         allow_all_env="ZULIP_ALLOW_ALL_USERS",
+        # Lets Hermes cron accept ``deliver: zulip[:<stream_id>]`` targets.
+        # Without this, cron preflight rejects the job as "not a known cron
+        # delivery target" and never runs it. The env var supplies the default
+        # stream when no explicit id is given.
+        cron_deliver_env_var="ZULIP_HOME_CHANNEL",
         max_message_length=10000,
         platform_hint=(
             "You are chatting via Zulip. Messages are organized into streams and topics. "
