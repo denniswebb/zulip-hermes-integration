@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+- **Cron delivery**: register `cron_deliver_env_var="ZULIP_HOME_CHANNEL"` on the platform entry so Hermes cron accepts `deliver: zulip[:<stream_id>]` targets. Previously preflight blocked such jobs with "delivery platform 'zulip' is not a known cron delivery target" and never ran them.
+
 ## [1.8.0] - 2026-08-06
 
 ### Added
