@@ -1733,6 +1733,150 @@ def interactive_setup() -> None:
     print_info("Tip: Subscribe your bot to streams via Stream settings → Subscribers")
 
 
+# Topic used for out-of-process sends when the target carries no topic
+# (no ``zulip:<stream>:<topic>`` thread id and no inline
+# ``[[zulip_topic: …]]`` directive). Matches the in-process adapter's fallback for unknown chats.
+STANDALONE_DEFAULT_TOPIC = "general"
+
+
+def _resolve_standalone_credentials(pconfig) -> tuple[str, str, str]:
+    """Return ``(site, email, api_key)`` from the environment or ``pconfig.extra``.
+
+    Same precedence as :func:`validate_config`: the ``ZULIP_*`` environment
+    variables win, then the platform config's ``extra`` mapping.
+    """
+    extra = getattr(pconfig, "extra", {}) or {}
+    site = os.getenv("ZULIP_SITE") or extra.get("site") or ""
+    email = os.getenv("ZULIP_EMAIL") or extra.get("email") or ""
+    api_key = os.getenv("ZULIP_API_KEY") or extra.get("api_key") or ""
+    return site, email, api_key
+
+
+async def _standalone_send(
+    pconfig,
+    chat_id: str,
+    message: str,
+    *,
+    thread_id=None,
+    media_files=None,
+    force_document=False,
+) -> dict:
+    """Out-of-process Zulip delivery (Hermes ``standalone_sender_fn`` contract).
+
+    Hermes calls this from ``tools/send_message_tool._send_via_adapter`` when
+    no gateway adapter is live in the current process — e.g. ``hermes cron
+    run <job>`` from the CLI, or cron running separately from the gateway.
+    Without it, ``deliver: zulip[:<stream_id>]`` jobs fail with
+    ``No live adapter for platform 'zulip'``.
+
+    Arguments follow the contract in ``gateway/platform_registry.py``:
+
+    * ``chat_id`` — ``<stream_id>`` or ``dm:<user_id>`` (see :func:`_parse_target`).
+    * ``thread_id`` — the optional third segment of a ``zulip:<stream>:<topic>``
+      target; used as the Zulip topic. An inline ``[[zulip_topic: …]]`` directive in
+      the message wins over it, and :data:`STANDALONE_DEFAULT_TOPIC` is used
+      when neither is present. Ignored for DMs.
+    * ``media_files`` — local paths uploaded via ``/user_uploads`` and appended
+      to the message as links, exactly like :meth:`ZulipAdapter.send`.
+    * ``force_document`` — accepted for contract compatibility; Zulip has no
+      inline-vs-document distinction, so it has no effect.
+
+    Returns ``{"success": True, "message_id": "<id>"}`` or ``{"error": "<why>"}``.
+    Never raises: every failure is reported through the ``error`` key so the
+    caller can record it as the job's delivery error.
+    """
+    site, email, api_key = _resolve_standalone_credentials(pconfig)
+    if not (site and email and api_key):
+        return {
+            "error": "Zulip not configured (ZULIP_SITE, ZULIP_EMAIL, ZULIP_API_KEY required)"
+        }
+
+    try:
+        client = _get_cached_client(site, email, api_key)
+    except ImportError as e:
+        return {"error": str(e)}
+    except Exception as e:
+        return {"error": f"Zulip client init failed: {e}"}
+
+    try:
+        target = _parse_target(chat_id)
+    except (TypeError, ValueError):
+        return {
+            "error": (
+                f"Invalid Zulip target {chat_id!r}: expected a numeric stream id "
+                f"or 'dm:<user_id>'"
+            )
+        }
+
+    _connect_timeout, _read_timeout, send_timeout = _resolve_timeouts()
+    content = message or ""
+
+    # Media: upload first, then link — same shape as ZulipAdapter.send().
+    uploaded_urls: list[str] = []
+    if media_files:
+        data_dir = os.environ.get("HERMES_DATA_DIR", os.path.expanduser("~/.hermes"))
+        for file_path in media_files:
+            if isinstance(file_path, (tuple, list)):
+                # Some callers pass (path, is_voice) pairs.
+                file_path = file_path[0]
+            if not isinstance(file_path, str) or file_path.startswith(("http://", "https://")):
+                logger.warning(
+                    "zulip standalone send rejected media entry [entry=%s]",
+                    mask_pii(str(file_path)),
+                )
+                continue
+            try:
+                uploaded_urls.append(
+                    await upload_file_to_zulip(client, file_path, data_dir)
+                )
+            except Exception as e:
+                logger.error(
+                    "zulip standalone upload failed [file=%s]: %s",
+                    mask_pii(file_path),
+                    e,
+                )
+    if uploaded_urls:
+        file_links = "\n".join(f"[{Path(u).name}]({u})" for u in uploaded_urls)
+        content = f"{content}\n\n{file_links}" if content else file_links
+
+    content, topic_directive = extract_topic_directive(content)
+
+    prefix = _resolve_response_prefix()
+    if prefix and content:
+        content = prefix + content
+
+    if target["type"] == "dm":
+        payload = {"type": "private", "to": [target["user_id"]], "content": content}
+    else:
+        topic = topic_directive or (str(thread_id).strip() if thread_id else "") or STANDALONE_DEFAULT_TOPIC
+        payload = {
+            "type": "stream",
+            "to": target["stream_id"],
+            "topic": topic,
+            "content": content,
+        }
+
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(client.send_message, payload),
+            timeout=send_timeout,
+        )
+    except asyncio.TimeoutError:
+        return {"error": f"Zulip send timed out after {send_timeout}s"}
+    except Exception as e:
+        return {"error": f"Zulip send failed: {e}"}
+
+    if isinstance(result, dict) and result.get("result") == "success":
+        return {"success": True, "message_id": str(result.get("id", ""))}
+    if isinstance(result, dict):
+        detail = " ".join(
+            str(result[k]) for k in ("code", "msg") if result.get(k)
+        ) or mask_pii(str(result))
+    else:
+        detail = mask_pii(str(result))
+    return {"error": f"Zulip send failed: {detail}"}
+
+
 def register(ctx):
     """Plugin entry point — called by the Hermes plugin system."""
     ctx.register_platform(
@@ -1746,6 +1890,10 @@ def register(ctx):
         env_enablement_fn=_env_enablement,
         allowed_users_env="ZULIP_ALLOWED_USERS",
         allow_all_env="ZULIP_ALLOW_ALL_USERS",
+        # Out-of-process delivery (``hermes cron run``, cron in its own
+        # process): without this, Hermes has no way to send to Zulip when no
+        # gateway adapter is live and reports "No live adapter for platform".
+        standalone_sender_fn=_standalone_send,
         max_message_length=10000,
         platform_hint=(
             "You are chatting via Zulip. Messages are organized into streams and topics. "

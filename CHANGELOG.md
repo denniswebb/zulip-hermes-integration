@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+- **Out-of-process delivery**: register a `standalone_sender_fn` (`_standalone_send`) on the Hermes `PlatformEntry` so `deliver: zulip[:<stream_id>[:<topic>]]` cron jobs can send when no gateway adapter is live in the calling process (`hermes cron run <job>`, cron in its own process). Previously such sends failed with `No live adapter for platform 'zulip'`. Supports streams (`<stream_id>`), DMs (`dm:<user_id>`), the `zulip:<stream>:<topic>` thread segment as topic, inline `[[zulip_topic: …]]` directives, `ZULIP_RESPONSE_PREFIX`, media uploads, and `ZULIP_SEND_TIMEOUT`.
+
 ## [1.8.0] - 2026-08-06
 
 ### Added
