@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 - **Startup recovery**: `recover_interrupted_messages()` called `Client.get_private_messages`, which does not exist in the zulip SDK, so every gateway start logged `zulip recovery: failed [error='Client' object has no attribute 'get_private_messages']` and interrupted DMs were never re-dispatched. It now fetches the last 100 direct messages via `Client.get_messages` (`is:dm` narrow).
+- **Session-scoped DM parsing**: `_parse_target()` now strips the `:session:N` suffix from DM chat IDs (e.g. `dm:1032616:session:1`) so replies to rotated DM sessions are delivered correctly. Previously `int()` choked on the extra colons and silently dropped the message. (Issue #111)
 
 ## [1.8.0] - 2026-08-06
 
