@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 - **Cron delivery**: register `cron_deliver_env_var="ZULIP_HOME_CHANNEL"` on the platform entry so Hermes cron accepts `deliver: zulip[:<stream_id>]` targets. Previously preflight blocked such jobs with "delivery platform 'zulip' is not a known cron delivery target" and never ran them.
+### Added
+- **Out-of-process delivery**: register a `standalone_sender_fn` (`_standalone_send`) on the Hermes `PlatformEntry` so `deliver: zulip[:<stream_id>[:<topic>]]` cron jobs can send when no gateway adapter is live in the calling process (`hermes cron run <job>`, cron in its own process). Previously such sends failed with `No live adapter for platform 'zulip'`. Supports streams (`<stream_id>`), DMs (`dm:<user_id>`), the `zulip:<stream>:<topic>` thread segment as topic, inline `[[zulip_topic: …]]` directives, `ZULIP_RESPONSE_PREFIX`, media uploads, and `ZULIP_SEND_TIMEOUT`.
+### Fixed
+- **Startup recovery**: `recover_interrupted_messages()` called `Client.get_private_messages`, which does not exist in the zulip SDK, so every gateway start logged `zulip recovery: failed [error='Client' object has no attribute 'get_private_messages']` and interrupted DMs were never re-dispatched. It now fetches the last 100 direct messages via `Client.get_messages` (`is:dm` narrow).
+- **Session-scoped DM parsing**: `_parse_target()` now strips the `:session:N` suffix from DM chat IDs (e.g. `dm:1032616:session:1`) so replies to rotated DM sessions are delivered correctly. Previously `int()` choked on the extra colons and silently dropped the message. (Issue #111)
 
 ## [1.8.0] - 2026-08-06
 

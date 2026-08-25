@@ -11,6 +11,13 @@ from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
+# How many recent DMs to scan for stale 👀 reactions on startup.
+RECOVERY_SCAN_LIMIT = 100
+
+# ``is:dm`` narrows to direct messages (Zulip server >= 7.0; older servers
+# accept the legacy ``is:private`` spelling, and modern ones still honour it).
+RECOVERY_NARROW = [{"operator": "is", "operand": "dm"}]
+
 
 async def recover_interrupted_messages(
     client: Any,
@@ -34,9 +41,18 @@ async def recover_interrupted_messages(
     recovered = 0
 
     try:
-        # Fetch recent private messages
+        # Fetch recent direct messages, oldest first, via the SDK's generic
+        # ``get_messages`` (GET /messages). The zulip SDK has no
+        # ``get_private_messages`` method, so the former call raised
+        # AttributeError on every gateway start and recovery never ran.
         result = await sdk_call(
-            client.get_private_messages,
+            client.get_messages,
+            {
+                "anchor": "newest",
+                "num_before": RECOVERY_SCAN_LIMIT,
+                "num_after": 0,
+                "narrow": RECOVERY_NARROW,
+            },
             timeout=send_timeout,
         )
 
