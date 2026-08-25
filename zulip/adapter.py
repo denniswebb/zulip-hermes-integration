@@ -167,7 +167,11 @@ def _parse_target(chat_id: str) -> dict[str, Any]:
         return cached
 
     if chat_id.startswith("dm:"):
-        info = {"type": "dm", "user_id": int(chat_id[3:])}
+        # Session-scoped DM chat_ids include a `:session:N` suffix (e.g.
+        # `dm:1032616:session:1`). Strip everything after the user id so
+        # the send path resolves the correct target. (Issue #111)
+        user_part = chat_id[3:].split(":", 1)[0]
+        info = {"type": "dm", "user_id": int(user_part)}
     else:
         info = {"type": "stream", "stream_id": int(chat_id)}
 
@@ -839,8 +843,10 @@ class ZulipAdapter(BasePlatformAdapter):
 
                 if events.get("result") == "error":
                     msg = events.get("msg", "")
+                    code = events.get("code")
                     is_bad_queue = (
-                        events.get("code") == "BAD_EVENT_QUEUE_ID"
+                        code == "BAD_EVENT_QUEUE_ID"
+                        or (code == "BAD_REQUEST" and "event newer than" in msg.lower() and "pruned" in msg.lower())
                         or "bad event queue" in msg.lower()
                     )
                     if is_bad_queue:

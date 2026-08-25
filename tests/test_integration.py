@@ -22,6 +22,7 @@ class TestFullFlow:
         class MockClient:
             def __init__(self, **kw):
                 self.calls = calls
+                self.register_calls = 0
             def send_message(self, req):
                 msg_id = len(self.calls["send_message"]) + 1000
                 self.calls["send_message"].append(req)
@@ -49,7 +50,8 @@ class TestFullFlow:
             def update_message_flags(self, req):
                 return {"result": "success"}
             def register(self, **kw):
-                return {"result": "success", "queue_id": "q1", "last_event_id": 1}
+                self.register_calls += 1
+                return {"result": "success", "queue_id": f"q{self.register_calls}", "last_event_id": 1}
             def get_events(self, **kw):
                 return {"result": "success", "events": []}
 
@@ -108,7 +110,11 @@ class TestFullFlow:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                return {"result": "error", "code": "BAD_EVENT_QUEUE_ID", "msg": "bad queue"}
+                return {
+                    "result": "error",
+                    "code": "BAD_REQUEST",
+                    "msg": "An event newer than 105 has already been pruned!",
+                }
             return {"result": "success", "events": []}
 
         adapter.client.get_events = fake_get_events
@@ -117,6 +123,7 @@ class TestFullFlow:
         for _ in range(3):
             await asyncio.sleep(0.01)
         await adapter.disconnect()
+        assert adapter.client.register_calls >= 2
 
     @pytest.mark.asyncio
     async def test_topic_directive_end_to_end(self, adapter):
