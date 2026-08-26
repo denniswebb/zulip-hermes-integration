@@ -55,6 +55,14 @@ class TestSendChunking:
         assert adapter.client._calls == [{"type": "private", "to": [42], "content": "Hello world"}]
 
     @pytest.mark.asyncio
+    async def test_group_dm_preserves_all_recipient_ids(self, adapter):
+        result = await adapter.send("dm:7,42,99", "Hello group")
+        assert result.success is True
+        assert adapter.client._calls == [
+            {"type": "private", "to": [7, 42, 99], "content": "Hello group"}
+        ]
+
+    @pytest.mark.asyncio
     async def test_long_message_chunked(self, adapter, monkeypatch):
         monkeypatch.setenv("ZULIP_TEXT_CHUNK_LIMIT", "10")
         # Reload config inside the adapter method uses env at call time

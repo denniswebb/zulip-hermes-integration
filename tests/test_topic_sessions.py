@@ -64,6 +64,16 @@ class TestTopicScoping:
             "sender_id": 42,
         }
 
+    def _group_dm(self) -> dict:
+        return {
+            **self._dm(),
+            "display_recipient": [
+                {"id": 7, "email": "bot@zulip.com", "full_name": "Test Bot"},
+                {"id": 42, "email": "user@zulip.com", "full_name": "User"},
+                {"id": 99, "email": "other-bot@zulip.com", "full_name": "Other Bot"},
+            ],
+        }
+
     @pytest.mark.asyncio
     async def test_topic_not_used_for_session_by_default(self, adapter, monkeypatch):
         monkeypatch.setenv("ZULIP_CHATMODE", "onmessage")
@@ -108,3 +118,11 @@ class TestTopicScoping:
         source = adapter.handle_message.call_args[0][0].source
         assert source.chat_type == "dm"
         assert not getattr(source, "thread_id", "")
+
+    @pytest.mark.asyncio
+    async def test_group_dm_uses_the_full_recipient_set_as_chat_id(self, adapter, monkeypatch):
+        monkeypatch.setenv("ZULIP_TOPIC_SESSIONS", "true")
+        await adapter._handle_message(self._group_dm())
+        event = adapter.handle_message.call_args[0][0]
+        assert event.source.chat_id == "dm:7,42,99"
+        assert event.metadata["recipient_ids"] == [7, 42, 99]

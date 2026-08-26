@@ -158,7 +158,8 @@ Temp files auto-delete after upload. Path traversal is blocked.
 
 **Chat ID format:**
 - Stream: `"573423"` (numeric stream ID)
-- DM: `"dm:1032616"` (`dm:` + user ID)
+- DM: `"dm:1032616"` (`dm:` + user ID); group DMs preserve the full
+  recipient set as comma-separated IDs, e.g. `"dm:1032616,1234567,2345678"`.
 
 ---
 

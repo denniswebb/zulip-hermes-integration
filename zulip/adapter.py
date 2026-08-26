@@ -138,7 +138,8 @@ def _get_cached_client(site: str, email: str, api_key: str, *, _zulip_mod: Any =
 def _get_cached_target(chat_id: str) -> dict[str, Any] | None:
     """Return cached target info or None.
 
-    Target info: {"type": "dm", "user_id": int} | {"type": "stream", "stream_id": int}
+    Target info: {"type": "dm", "user_ids": list[int]} |
+    {"type": "stream", "stream_id": int}
     """
     info = _target_cache.get(chat_id)
     if info is not None:
@@ -167,12 +168,62 @@ def _parse_target(chat_id: str) -> dict[str, Any]:
         return cached
 
     if chat_id.startswith("dm:"):
-        info = {"type": "dm", "user_id": int(chat_id[3:])}
+        recipient_parts = chat_id[3:].split(",")
+        recipient_ids = [int(part) for part in recipient_parts]
+        if not recipient_ids:
+            raise ValueError("DM target must include at least one recipient")
+        # Keep ``user_id`` for callers that inspect the cached target for a
+        # one-to-one DM; sending always uses the complete ``user_ids`` list.
+        info = {
+            "type": "dm",
+            "user_ids": recipient_ids,
+            "user_id": recipient_ids[0],
+        }
     else:
         info = {"type": "stream", "stream_id": int(chat_id)}
 
     _set_cached_target(chat_id, info)
     return info
+
+
+def _private_recipient_ids(message: dict[str, Any]) -> list[int]:
+    """Return every recipient of an incoming private message.
+
+    Zulip represents a direct message's ``display_recipient`` as a list of
+    recipient dictionaries. A one-to-one DM has two entries (sender and bot);
+    a group DM has more. Preserve the complete recipient set so a reply remains
+    in the original private conversation instead of starting a one-to-one DM
+    with only the sender.
+
+    Older or malformed events may omit the recipient list, so fall back to the
+    sender ID. That retains the previous behavior for one-to-one DMs.
+    """
+    recipient_ids: set[int] = set()
+    recipients = message.get("display_recipient")
+    if isinstance(recipients, list):
+        for recipient in recipients:
+            if not isinstance(recipient, dict):
+                continue
+            try:
+                recipient_ids.add(int(recipient["id"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+
+    if not recipient_ids:
+        try:
+            recipient_ids.add(int(message["sender_id"]))
+        except (KeyError, TypeError, ValueError):
+            pass
+
+    return sorted(recipient_ids)
+
+
+def _private_chat_id(message: dict[str, Any]) -> str:
+    """Encode a private-message recipient set as a stable adapter chat ID."""
+    recipient_ids = _private_recipient_ids(message)
+    if not recipient_ids:
+        raise ValueError("Private message has no usable recipient IDs")
+    return f"dm:{','.join(str(user_id) for user_id in recipient_ids)}"
 
 
 def _clear_caches() -> None:
@@ -1065,7 +1116,7 @@ class ZulipAdapter(BasePlatformAdapter):
             typing_params = {
                 "op": "start",
                 "type": "direct",
-                "to": [message.get("sender_id")],
+                "to": _private_recipient_ids(message),
             }
         elif msg_type == "stream":
             typing_stream_id = message.get("stream_id")
@@ -1096,7 +1147,7 @@ class ZulipAdapter(BasePlatformAdapter):
                 cmd_chat_id = str(message.get("stream_id", ""))
                 cmd_topic = message.get("subject", "")
             else:
-                cmd_chat_id = f"dm:{message.get('sender_id', '')}"
+                cmd_chat_id = _private_chat_id(message)
                 cmd_topic = None
 
             cmd_result = handle_command(
@@ -1125,7 +1176,7 @@ class ZulipAdapter(BasePlatformAdapter):
                             self.client.send_message,
                             {
                                 "type": "private",
-                                "to": [message.get("sender_id")],
+                                "to": _private_recipient_ids(message),
                                 "content": cmd_result.reply,
                             },
                             timeout=self._send_timeout,
@@ -1164,7 +1215,7 @@ class ZulipAdapter(BasePlatformAdapter):
                         self.client.send_message,
                         {
                             "type": "private",
-                            "to": [message.get("sender_id")],
+                            "to": _private_recipient_ids(message),
                             "content": reply,
                         },
                         timeout=self._send_timeout,
@@ -1200,7 +1251,7 @@ class ZulipAdapter(BasePlatformAdapter):
             extra_meta = {"topic": topic, "stream_id": stream_id}
         else:
             sender_id = message.get("sender_id")
-            chat_id = f"dm:{sender_id}"
+            chat_id = _private_chat_id(message)
 
             # DM session rotation: prevent context bloat by rotating
             # the session key every N turns (default 20, 0 to disable).
@@ -1219,7 +1270,11 @@ class ZulipAdapter(BasePlatformAdapter):
                 user_id=sender_email,
                 user_name=sender_full_name,
             )
-            extra_meta = {"user_id": sender_id, "user_email": sender_email}
+            extra_meta = {
+                "user_id": sender_id,
+                "user_email": sender_email,
+                "recipient_ids": _private_recipient_ids(message),
+            }
 
         # --- Context-mitigation metadata ---
         now = time.time()
@@ -1593,7 +1648,7 @@ class ZulipAdapter(BasePlatformAdapter):
                     self.client.send_message,
                     {
                         "type": "private",
-                        "to": [target["user_id"]],
+                        "to": target["user_ids"],
                         "content": content,
                     },
                     timeout=self._send_timeout,
@@ -1773,7 +1828,9 @@ async def _standalone_send(
 
     Arguments follow the contract in ``gateway/platform_registry.py``:
 
-    * ``chat_id`` — ``<stream_id>`` or ``dm:<user_id>`` (see :func:`_parse_target`).
+    * ``chat_id`` — ``<stream_id>`` or ``dm:<user_id>[,<user_id>...]`` (see
+      :func:`_parse_target`). Multiple recipient IDs identify a Zulip group
+      direct-message conversation.
     * ``thread_id`` — the optional third segment of a ``zulip:<stream>:<topic>``
       target; used as the Zulip topic. An inline ``[[zulip_topic: …]]`` directive in
       the message wins over it, and :data:`STANDALONE_DEFAULT_TOPIC` is used
@@ -1806,7 +1863,7 @@ async def _standalone_send(
         return {
             "error": (
                 f"Invalid Zulip target {chat_id!r}: expected a numeric stream id "
-                f"or 'dm:<user_id>'"
+                f"or 'dm:<user_id>[,<user_id>...]'"
             )
         }
 
@@ -1848,7 +1905,7 @@ async def _standalone_send(
         content = prefix + content
 
     if target["type"] == "dm":
-        payload = {"type": "private", "to": [target["user_id"]], "content": content}
+        payload = {"type": "private", "to": target["user_ids"], "content": content}
     else:
         topic = topic_directive or (str(thread_id).strip() if thread_id else "") or STANDALONE_DEFAULT_TOPIC
         payload = {
