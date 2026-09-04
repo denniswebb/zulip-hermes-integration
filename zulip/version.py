@@ -11,6 +11,7 @@ __min_hermes__ = "0.18.2"
 # Files that make up the plugin — used by self-updater
 PLUGIN_FILES = [
     "__init__.py",
+    "accounts.py",
     "adapter.py",
     "admin_actions.py",
     "audit_logger.py",
@@ -26,6 +27,7 @@ PLUGIN_FILES = [
     "rate_limiter.py",
     "reactions.py",
     "recovery.py",
+    "runtime_scope.py",
     "text_utils.py",
     "updater.py",
     "version.py",

@@ -14,7 +14,9 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, Optional
+
+from .runtime_scope import get_setting
 
 logger = __import__("logging").getLogger(__name__)
 
@@ -39,7 +41,16 @@ class PairingCode:
 class PolicyEngine:
     """Manages DM and group/stream policies with disk persistence."""
 
-    def __init__(self, *, pairing_ttl: int = _PAIRING_CODE_TTL_SECONDS, data_dir: Optional[str] = None):
+    def __init__(
+        self,
+        *,
+        pairing_ttl: int = _PAIRING_CODE_TTL_SECONDS,
+        data_dir: Optional[str] = None,
+        settings: Mapping[str, str] | None = None,
+    ):
+        # The adapter passes an immutable snapshot. Direct users retain the
+        # legacy active-environment behavior through ``get_setting``.
+        self._settings = settings
         # DM policy
         self.mode = self._resolve_dm_mode()
         self.allowlist = self._parse_allowlist()
@@ -111,29 +122,30 @@ class PolicyEngine:
         except OSError as e:
             logger.warning("policy allowlist save failed: %s", e)
 
-    @staticmethod
-    def _resolve_dm_mode() -> str:
-        raw = os.getenv("ZULIP_DM_POLICY", "open").strip().lower()
+    def _setting(self, name: str, default: str = "") -> str:
+        if self._settings is not None:
+            return self._settings.get(name, default)
+        return get_setting(name, default) or default
+
+    def _resolve_dm_mode(self) -> str:
+        raw = self._setting("ZULIP_DM_POLICY", "open").strip().lower()
         return raw if raw in _VALID_POLICIES else POLICY_OPEN
 
-    @staticmethod
-    def _resolve_group_mode() -> str:
+    def _resolve_group_mode(self) -> str:
         """Group policy defaults to 'open' for backward compatibility."""
-        raw = os.getenv("ZULIP_GROUP_POLICY", "open").strip().lower()
+        raw = self._setting("ZULIP_GROUP_POLICY", "open").strip().lower()
         # Group policy does not support 'pairing'
         valid = frozenset({POLICY_OPEN, POLICY_ALLOWLIST, POLICY_DISABLED})
         return raw if raw in valid else POLICY_OPEN
 
-    @staticmethod
-    def _parse_allowlist() -> set[str]:
-        raw = os.getenv("ZULIP_ALLOWED_USERS", "").strip()
+    def _parse_allowlist(self) -> set[str]:
+        raw = self._setting("ZULIP_ALLOWED_USERS").strip()
         if not raw:
             return set()
         return {e.strip().lower() for e in raw.split(",") if e.strip()}
 
-    @staticmethod
-    def _parse_group_allowlist() -> set[str]:
-        raw = os.getenv("ZULIP_GROUP_ALLOW_FROM", "").strip()
+    def _parse_group_allowlist(self) -> set[str]:
+        raw = self._setting("ZULIP_GROUP_ALLOW_FROM").strip()
         if not raw:
             return set()
         return {e.strip().lower() for e in raw.split(",") if e.strip()}

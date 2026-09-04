@@ -8,12 +8,11 @@ Supports stream messages (with topics) and private messages.
 import asyncio
 import json
 import logging
-import os
 import tempfile
 import time
 from collections import OrderedDict
 from pathlib import Path
-from typing import Optional, Any, overload
+from typing import Optional, Any, Mapping, overload
 
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -47,6 +46,16 @@ from .probe import probe_zulip, _normalize_base_url
 from .recovery import recover_interrupted_messages
 from .rate_limiter import RateLimiter
 from .audit_logger import AuditLogger
+from .runtime_scope import (
+    PROFILE_DATA_DIR_EXTRA_KEY,
+    SCOPED_SETTINGS_EXTRA_KEY,
+    get_profile_data_dir,
+    get_setting,
+    has_active_profile_scope,
+    is_unscoped_multiplexer,
+    should_snapshot_settings,
+    snapshot_settings,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -280,19 +289,50 @@ DEFAULT_SEND_TIMEOUT = 90.0
 # before the typing indicator stops and the success reaction appears.
 DEFAULT_TYPING_DELAY = 2.0
 
+# Resolve these once while Hermes has installed this adapter's profile scope.
+# The event listener later runs in its own task, where a different profile may
+# be active, so reading settings lazily there would cross-contaminate adapters.
+_ADAPTER_SETTING_NAMES = (
+    "ZULIP_API_KEY", "ZULIP_EMAIL", "ZULIP_SITE",
+    "ZULIP_TEXT_CHUNK_LIMIT", "ZULIP_CHUNK_MODE",
+    "ZULIP_CONNECT_TIMEOUT", "ZULIP_READ_TIMEOUT", "ZULIP_SEND_TIMEOUT",
+    "ZULIP_TYPING_DELAY_SECONDS", "ZULIP_STREAMS", "ZULIP_RESPONSE_PREFIX",
+    "ZULIP_STREAM_OVERRIDES", "ZULIP_CHATMODE", "ZULIP_ONCHAR_PREFIXES",
+    "ZULIP_REQUIRE_MENTION", "ZULIP_TOPIC_SESSIONS",
+    "ZULIP_DM_SESSION_TURN_LIMIT", "ZULIP_BLOCK_STREAMING",
+    "ZULIP_MAX_MESSAGES_PER_MINUTE", "ZULIP_REACTIONS_ENABLED",
+    "ZULIP_REACTION_CLEAR_ON_FINISH", "ZULIP_REACTION_START",
+    "ZULIP_REACTION_SUCCESS", "ZULIP_REACTION_ERROR", "ZULIP_MEDIA_MAX_MB",
+    "ZULIP_DM_POLICY", "ZULIP_GROUP_POLICY", "ZULIP_ALLOWED_USERS",
+    "ZULIP_GROUP_ALLOW_FROM",
+)
+def _captured_settings(extra: Mapping[str, Any]) -> dict[str, str] | None:
+    """Return config-load scoped settings retained in ``PlatformConfig.extra``."""
+    captured = extra.get(SCOPED_SETTINGS_EXTRA_KEY)
+    if not isinstance(captured, dict):
+        return None
+    return {str(name): str(value) for name, value in captured.items()}
 
-def _resolve_chunk_config() -> tuple[int, str]:
-    """Read chunking config from environment."""
-    limit_raw = os.getenv("ZULIP_TEXT_CHUNK_LIMIT", "").strip()
+
+def _setting(name: str, default: str = "", settings: Mapping[str, str] | None = None) -> str:
+    """Read a scoped setting, optionally from an adapter's immutable snapshot."""
+    if settings is not None:
+        return settings.get(name) or default
+    return get_setting(name, default) or default
+
+
+def _resolve_chunk_config(settings: Mapping[str, str] | None = None) -> tuple[int, str]:
+    """Read chunking config from the active profile scope."""
+    limit_raw = _setting("ZULIP_TEXT_CHUNK_LIMIT", settings=settings).strip()
     limit = int(limit_raw) if limit_raw.isdigit() else DEFAULT_CHUNK_LIMIT
-    mode = os.getenv("ZULIP_CHUNK_MODE", DEFAULT_CHUNK_MODE).strip()
+    mode = _setting("ZULIP_CHUNK_MODE", DEFAULT_CHUNK_MODE, settings).strip()
     if mode not in ("length", "newline"):
         mode = DEFAULT_CHUNK_MODE
     return limit, mode
 
 
-def _resolve_timeouts() -> tuple[float, float, float]:
-    """Read timeout config from environment.
+def _resolve_timeouts(settings: Mapping[str, str] | None = None) -> tuple[float, float, float]:
+    """Read timeout config from the active profile scope.
 
     Returns (connect_timeout, read_timeout, send_timeout) in seconds.
     """
@@ -302,13 +342,13 @@ def _resolve_timeouts() -> tuple[float, float, float]:
         except (ValueError, AttributeError):
             return default
 
-    connect = _parse(os.getenv("ZULIP_CONNECT_TIMEOUT", ""), DEFAULT_CONNECT_TIMEOUT)
-    read = _parse(os.getenv("ZULIP_READ_TIMEOUT", ""), DEFAULT_READ_TIMEOUT)
-    send = _parse(os.getenv("ZULIP_SEND_TIMEOUT", ""), DEFAULT_SEND_TIMEOUT)
+    connect = _parse(_setting("ZULIP_CONNECT_TIMEOUT", settings=settings), DEFAULT_CONNECT_TIMEOUT)
+    read = _parse(_setting("ZULIP_READ_TIMEOUT", settings=settings), DEFAULT_READ_TIMEOUT)
+    send = _parse(_setting("ZULIP_SEND_TIMEOUT", settings=settings), DEFAULT_SEND_TIMEOUT)
     return connect, read, send
 
 
-def _resolve_typing_delay() -> float:
+def _resolve_typing_delay(settings: Mapping[str, str] | None = None) -> float:
     """Read typing indicator delay from environment.
 
     After the message is accepted by the Zulip API, the typing indicator
@@ -316,31 +356,31 @@ def _resolve_typing_delay() -> float:
     to all clients before the indicator stops and the success reaction fires.
     """
     try:
-        val = float(os.getenv("ZULIP_TYPING_DELAY_SECONDS", "").strip())
+        val = float(_setting("ZULIP_TYPING_DELAY_SECONDS", settings=settings).strip())
         return max(0.0, val)
     except (ValueError, AttributeError):
         return DEFAULT_TYPING_DELAY
 
 
-def _resolve_streams_filter() -> set[str] | None:
-    """Read stream filtering config from environment.
+def _resolve_streams_filter(settings: Mapping[str, str] | None = None) -> set[str] | None:
+    """Read stream filtering config from the active profile scope.
 
     Returns None if all streams are allowed (default), or a set of
     lowercase stream names to monitor.
     """
-    raw = os.getenv("ZULIP_STREAMS", "").strip()
+    raw = _setting("ZULIP_STREAMS", settings=settings).strip()
     if not raw or raw == "*":
         return None
     return {s.strip().lower() for s in raw.split(",") if s.strip()}
 
 
-def _resolve_response_prefix() -> str:
-    """Read outbound response prefix from environment."""
-    return os.getenv("ZULIP_RESPONSE_PREFIX", "")
+def _resolve_response_prefix(settings: Mapping[str, str] | None = None) -> str:
+    """Read outbound response prefix from the active profile scope."""
+    return _setting("ZULIP_RESPONSE_PREFIX", settings=settings)
 
 
-def _resolve_stream_overrides() -> dict[str, dict[str, Any]]:
-    """Read per-stream trigger overrides from the environment.
+def _resolve_stream_overrides(settings: Mapping[str, str] | None = None) -> dict[str, dict[str, Any]]:
+    """Read per-stream trigger overrides from the active profile scope.
 
     ``ZULIP_STREAM_OVERRIDES`` is a JSON object mapping stream name to a
     settings object, overriding ``ZULIP_CHATMODE`` for that stream::
@@ -360,7 +400,7 @@ def _resolve_stream_overrides() -> dict[str, dict[str, Any]]:
     Unrecognised setting keys are warned about. Malformed configuration is
     logged and ignored rather than raised.
     """
-    raw = os.getenv("ZULIP_STREAM_OVERRIDES", "").strip()
+    raw = _setting("ZULIP_STREAM_OVERRIDES", settings=settings).strip()
     if len(raw.encode("utf-8")) > _MAX_JSON_OVERRIDES_BYTES:
         logger.warning(
             "ZULIP_STREAM_OVERRIDES exceeds max size (%d > %d bytes); ignoring overrides",
@@ -439,30 +479,32 @@ def _resolve_stream_overrides() -> dict[str, dict[str, Any]]:
 
 
 @overload
-def _resolve_chatmode() -> tuple[str, list[str], bool]:
+def _resolve_chatmode(settings: Mapping[str, str] | None = None) -> tuple[str, list[str], bool]:
     ...
 
 
 @overload
-def _resolve_chatmode(stream_name: str) -> tuple[str, list[str], bool]:
+def _resolve_chatmode(stream_name: str, settings: Mapping[str, str] | None = None) -> tuple[str, list[str], bool]:
     ...
 
 
-def _resolve_chatmode(stream_name: Optional[str] = None) -> tuple[str, list[str], bool]:
-    """Read stream trigger mode config from environment.
+def _resolve_chatmode(
+    stream_name: Optional[str] = None, settings: Mapping[str, str] | None = None
+) -> tuple[str, list[str], bool]:
+    """Read stream trigger mode config from the active profile scope.
 
     When ``stream_name`` is supplied, a matching entry in
     ``ZULIP_STREAM_OVERRIDES`` takes precedence over the global
     ``ZULIP_CHATMODE`` for that stream only.
     """
-    mode = os.getenv("ZULIP_CHATMODE", "onmessage").strip().lower()
+    mode = _setting("ZULIP_CHATMODE", "onmessage", settings).strip().lower()
     if mode not in ("onmessage", "oncall", "onchar"):
         mode = "onmessage"
-    prefixes = resolve_onchar_prefixes(os.getenv("ZULIP_ONCHAR_PREFIXES", ""))
-    require_mention = os.getenv("ZULIP_REQUIRE_MENTION", "true").strip().lower() not in ("false", "0", "no", "off")
+    prefixes = resolve_onchar_prefixes(_setting("ZULIP_ONCHAR_PREFIXES", settings=settings))
+    require_mention = _setting("ZULIP_REQUIRE_MENTION", "true", settings).strip().lower() not in ("false", "0", "no", "off")
 
     if stream_name:
-        override = _resolve_stream_overrides().get(stream_name.strip().lower())
+        override = _resolve_stream_overrides(settings).get(stream_name.strip().lower())
         if override:
             mode = override.get("chatmode", mode)
 
@@ -485,7 +527,7 @@ def _message_with_flags(event: dict) -> dict:
     return message
 
 
-def _topic_sessions_enabled() -> bool:
+def _topic_sessions_enabled(settings: Mapping[str, str] | None = None) -> bool:
     """Whether each Zulip topic should get its own conversation session.
 
     Off by default. When enabled, the topic is passed to ``build_source`` as
@@ -496,7 +538,7 @@ def _topic_sessions_enabled() -> bool:
     This is opt-in because turning it on splits an existing stream's history
     into per-topic sessions, which changes what an agent remembers.
     """
-    return os.getenv("ZULIP_TOPIC_SESSIONS", "").strip().lower() in ("true", "1", "yes", "on")
+    return _setting("ZULIP_TOPIC_SESSIONS", settings=settings).strip().lower() in ("true", "1", "yes", "on")
 
 
 def _safe_delete_temp_file(file_path: str) -> None:
@@ -532,10 +574,27 @@ class ZulipAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("zulip"))
         extra = config.extra or {}
+        # Keep standalone adapters live-configurable as before. Hermes profile
+        # scopes are different: capture them now before listener tasks detach
+        # from this construction context.
+        self._settings = _captured_settings(extra)
+        if self._settings is None and should_snapshot_settings():
+            # Hermes constructs the primary adapter after config loading has
+            # cleared its scope. Direct/injected config is still safe here:
+            # use only explicit ``extra`` credentials and defaults, never the
+            # process environment that may belong to another profile.
+            self._settings = (
+                snapshot_settings(_ADAPTER_SETTING_NAMES)
+                if has_active_profile_scope()
+                else {name: "" for name in _ADAPTER_SETTING_NAMES}
+            )
 
-        self.api_key = os.getenv("ZULIP_API_KEY") or extra.get("api_key", "")
-        self.email = os.getenv("ZULIP_EMAIL") or extra.get("email", "")
-        self.site = os.getenv("ZULIP_SITE") or extra.get("site", "")
+        self.api_key = _setting("ZULIP_API_KEY", settings=self._settings) or extra.get("api_key", "")
+        # Conventional credential alias used by Hermes duplicate-platform
+        # detection. It is intentionally never included in logs.
+        self.api_token = self.api_key
+        self.email = _setting("ZULIP_EMAIL", settings=self._settings) or extra.get("email", "")
+        self.site = _setting("ZULIP_SITE", settings=self._settings) or extra.get("site", "")
         # Populated on connect. Zulip renders mentions from the display name,
         # not the email local-part, so mention matching needs it.
         self.bot_full_name = ""
@@ -567,33 +626,33 @@ class ZulipAdapter(BasePlatformAdapter):
         self._last_message_time: dict[str, float] = {}   # chat_id → last message epoch
         # DM session rotation: prevents context bloat in long conversations
         self._dm_session_turn_limit = int(
-            os.getenv("ZULIP_DM_SESSION_TURN_LIMIT", "20").strip()
+            _setting("ZULIP_DM_SESSION_TURN_LIMIT", "20", self._settings).strip()
         )
         self._dm_base_message_counts: dict[str, int] = {}  # base_session_key → turn count
 
         # Block streaming config (Issue #49 — requires gateway-level streaming support)
         self._block_streaming = (
-            os.getenv("ZULIP_BLOCK_STREAMING", "").strip().lower() in ("true", "1", "yes", "on")
+            _setting("ZULIP_BLOCK_STREAMING", settings=self._settings).strip().lower() in ("true", "1", "yes", "on")
         )
 
-        self._data_dir = os.environ.get("HERMES_DATA_DIR", os.path.expanduser("~/.hermes"))
+        self._data_dir = extra.get(PROFILE_DATA_DIR_EXTRA_KEY) or get_profile_data_dir()
 
         # Timeout configuration (Issue #62)
-        self._connect_timeout, self._read_timeout, self._send_timeout = _resolve_timeouts()
+        self._connect_timeout, self._read_timeout, self._send_timeout = _resolve_timeouts(self._settings)
 
         # Typing indicator delay (Issue #96)
-        self._typing_delay = _resolve_typing_delay()
+        self._typing_delay = _resolve_typing_delay(self._settings)
 
         # Stream filtering (Issue #65) — None means all streams
-        self._streams_filter = _resolve_streams_filter()
+        self._streams_filter = _resolve_streams_filter(self._settings)
 
         # Response prefix (Issue #65) — prepended to every outbound message
-        self._response_prefix = _resolve_response_prefix()
+        self._response_prefix = _resolve_response_prefix(self._settings)
 
         # Rate limiter (per-sender, sliding window)
         self._rate_limiter = RateLimiter(
             max_per_minute=int(
-                os.getenv("ZULIP_MAX_MESSAGES_PER_MINUTE", "60").strip()
+                _setting("ZULIP_MAX_MESSAGES_PER_MINUTE", "60", self._settings).strip()
             ),
         )
 
@@ -620,10 +679,10 @@ class ZulipAdapter(BasePlatformAdapter):
         self._dedupe.load()
 
         # Reaction config
-        self._reaction_cfg = ReactionConfig.from_env()
+        self._reaction_cfg = ReactionConfig.from_env(self._settings)
 
         # DM policy engine (Issue #48 — controls who can DM the bot)
-        self._policy = PolicyEngine(data_dir=self._data_dir)
+        self._policy = PolicyEngine(data_dir=self._data_dir, settings=self._settings)
 
         self._listening = False
         self._event_task: Optional[asyncio.Task] = None
@@ -991,7 +1050,9 @@ class ZulipAdapter(BasePlatformAdapter):
             # malformed event would otherwise raise AttributeError inside the
             # handler rather than being skipped.
             stream_name = str(message.get("display_recipient", ""))
-            chatmode, onchar_prefixes, require_mention = _resolve_chatmode(stream_name)
+            chatmode, onchar_prefixes, require_mention = _resolve_chatmode(
+                stream_name, self._settings
+            )
 
             # Check onchar trigger
             onchar_triggered, stripped = strip_onchar_prefix(content, onchar_prefixes)
@@ -1245,7 +1306,7 @@ class ZulipAdapter(BasePlatformAdapter):
                 "user_id": sender_email,
                 "user_name": sender_full_name,
             }
-            if topic and _topic_sessions_enabled():
+            if topic and _topic_sessions_enabled(self._settings):
                 source_kwargs["thread_id"] = topic
             source = self.build_source(**source_kwargs)
             extra_meta = {"topic": topic, "stream_id": stream_id}
@@ -1573,7 +1634,6 @@ class ZulipAdapter(BasePlatformAdapter):
         uploaded_urls = []
         uploaded_local_paths = []
         if media_files:
-            data_dir = os.environ.get("HERMES_DATA_DIR", os.path.expanduser("~/.hermes"))
             for file_path in media_files:
                 # Security: reject URL-like values in media_files (must be local paths)
                 if isinstance(file_path, str) and (file_path.startswith("http://") or file_path.startswith("https://")):
@@ -1584,7 +1644,7 @@ class ZulipAdapter(BasePlatformAdapter):
                     continue
                 try:
                     url = await upload_file_to_zulip(
-                        self.client, file_path, data_dir
+                        self.client, file_path, self._data_dir
                     )
                     uploaded_urls.append(url)
                     uploaded_local_paths.append(file_path)
@@ -1606,7 +1666,7 @@ class ZulipAdapter(BasePlatformAdapter):
         # Extract inline topic directive if present
         content, topic_override = extract_topic_directive(content)
 
-        limit, mode = _resolve_chunk_config()
+        limit, mode = _resolve_chunk_config(self._settings)
         chunks = chunk_text(content, limit=limit, mode=mode)
 
         if not chunks:
@@ -1704,22 +1764,39 @@ def check_requirements() -> bool:
 def validate_config(config) -> bool:
     """Validate that required credentials are present."""
     extra = getattr(config, "extra", {}) or {}
+    settings = _captured_settings(extra)
+    if settings is None and is_unscoped_multiplexer():
+        # Explicit config is safe; do not ask the fail-closed resolver to
+        # inspect process-global environment variables in this state.
+        return bool(
+            extra.get("api_key") and extra.get("email") and extra.get("site")
+        )
     return bool(
-        (os.getenv("ZULIP_API_KEY") or extra.get("api_key"))
-        and (os.getenv("ZULIP_EMAIL") or extra.get("email"))
-        and (os.getenv("ZULIP_SITE") or extra.get("site"))
+        (_setting("ZULIP_API_KEY", settings=settings) or extra.get("api_key"))
+        and (_setting("ZULIP_EMAIL", settings=settings) or extra.get("email"))
+        and (_setting("ZULIP_SITE", settings=settings) or extra.get("site"))
     )
 
 
-def _env_enablement() -> dict | None:
+def _env_enablement() -> dict:
     """Seed PlatformConfig.extra from environment variables."""
-    key = os.getenv("ZULIP_API_KEY", "").strip()
-    email = os.getenv("ZULIP_EMAIL", "").strip()
-    site = os.getenv("ZULIP_SITE", "").strip()
-    if not (key and email and site):
-        return None
-
-    return {"api_key": key, "email": email, "site": site}
+    settings = snapshot_settings(_ADAPTER_SETTING_NAMES)
+    key = settings["ZULIP_API_KEY"].strip()
+    email = settings["ZULIP_EMAIL"].strip()
+    site = settings["ZULIP_SITE"].strip()
+    # Keep the profile snapshot even with partial/no environment credentials:
+    # configuration-layer credentials can be merged into this ``extra`` later.
+    result: dict[str, Any] = {
+        SCOPED_SETTINGS_EXTRA_KEY: settings,
+        PROFILE_DATA_DIR_EXTRA_KEY: get_profile_data_dir(),
+    }
+    if key:
+        result["api_key"] = key
+    if email:
+        result["email"] = email
+    if site:
+        result["site"] = site
+    return result
 
 
 def interactive_setup() -> None:
@@ -1797,15 +1874,19 @@ STANDALONE_DEFAULT_TOPIC = "general"
 
 
 def _resolve_standalone_credentials(pconfig) -> tuple[str, str, str]:
-    """Return ``(site, email, api_key)`` from the environment or ``pconfig.extra``.
+    """Return ``(site, email, api_key)`` from the active scope or ``extra``.
 
-    Same precedence as :func:`validate_config`: the ``ZULIP_*`` environment
-    variables win, then the platform config's ``extra`` mapping.
+    Same precedence as :func:`validate_config`: scoped ``ZULIP_*`` values win,
+    then the platform config's ``extra`` mapping. In a multiplexed scope, a
+    missing secret never falls through to a process-global value.
     """
     extra = getattr(pconfig, "extra", {}) or {}
-    site = os.getenv("ZULIP_SITE") or extra.get("site") or ""
-    email = os.getenv("ZULIP_EMAIL") or extra.get("email") or ""
-    api_key = os.getenv("ZULIP_API_KEY") or extra.get("api_key") or ""
+    settings = _captured_settings(extra)
+    if settings is None and is_unscoped_multiplexer():
+        settings = {name: "" for name in _ADAPTER_SETTING_NAMES}
+    site = _setting("ZULIP_SITE", settings=settings) or extra.get("site") or ""
+    email = _setting("ZULIP_EMAIL", settings=settings) or extra.get("email") or ""
+    api_key = _setting("ZULIP_API_KEY", settings=settings) or extra.get("api_key") or ""
     return site, email, api_key
 
 
@@ -1867,13 +1948,17 @@ async def _standalone_send(
             )
         }
 
-    _connect_timeout, _read_timeout, send_timeout = _resolve_timeouts()
+    extra = getattr(pconfig, "extra", {}) or {}
+    settings = _captured_settings(extra)
+    if settings is None and is_unscoped_multiplexer():
+        settings = {name: "" for name in _ADAPTER_SETTING_NAMES}
+    _connect_timeout, _read_timeout, send_timeout = _resolve_timeouts(settings)
     content = message or ""
 
     # Media: upload first, then link — same shape as ZulipAdapter.send().
     uploaded_urls: list[str] = []
     if media_files:
-        data_dir = os.environ.get("HERMES_DATA_DIR", os.path.expanduser("~/.hermes"))
+        data_dir = extra.get(PROFILE_DATA_DIR_EXTRA_KEY) or get_profile_data_dir()
         for file_path in media_files:
             if isinstance(file_path, (tuple, list)):
                 # Some callers pass (path, is_voice) pairs.
@@ -1900,7 +1985,7 @@ async def _standalone_send(
 
     content, topic_directive = extract_topic_directive(content)
 
-    prefix = _resolve_response_prefix()
+    prefix = _resolve_response_prefix(settings)
     if prefix and content:
         content = prefix + content
 

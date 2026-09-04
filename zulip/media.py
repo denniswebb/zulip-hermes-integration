@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urljoin, urlparse, unquote
 
+from .runtime_scope import get_setting
+
 logger = logging.getLogger(__name__)
 
 # Match Zulip upload paths in HTML
@@ -132,8 +134,8 @@ def _resolve_filename(url: str, content_disposition: Optional[str]) -> str:
 
 
 def resolve_media_max_mb() -> int:
-    """Read max upload size from environment."""
-    raw = os.getenv("ZULIP_MEDIA_MAX_MB", "").strip()
+    """Read max upload size from the active profile scope."""
+    raw = (get_setting("ZULIP_MEDIA_MAX_MB", "") or "").strip()
     return int(raw) if raw.isdigit() else DEFAULT_MAX_MB
 
 

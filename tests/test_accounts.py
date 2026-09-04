@@ -1,6 +1,8 @@
 """Tests for multi-account config resolver (Issue #48)."""
 
 import os
+import sys
+from types import ModuleType
 import pytest
 
 from zulip.accounts import AccountResolver, ZulipAccount
@@ -34,6 +36,56 @@ class TestSingleAccount:
         resolver = AccountResolver(extra={"email": "extra@company.com"})
         accounts = resolver.resolve()
         assert accounts[0].email == "env@company.com"
+
+    def test_active_profile_scope_wins_without_global_fallback(self, monkeypatch):
+        """AccountResolver must not borrow another profile's process env."""
+        values = {
+            "ZULIP_EMAIL": "scoped@company.com",
+            "ZULIP_API_KEY": "scoped-key",
+            "ZULIP_SITE": "https://scoped.zulipchat.com",
+            "ZULIP_DM_POLICY": "allowlist",
+        }
+        scope = ModuleType("agent.secret_scope")
+        scope.current_secret_scope = lambda: values
+        scope.is_multiplex_active = lambda: True
+        scope.get_secret = lambda name, default=None: values.get(name, default)
+        agent = ModuleType("agent")
+        agent.secret_scope = scope
+        monkeypatch.setitem(sys.modules, "agent", agent)
+        monkeypatch.setitem(sys.modules, "agent.secret_scope", scope)
+        monkeypatch.setenv("ZULIP_EMAIL", "global@company.com")
+        resolver = AccountResolver(extra={"email": "extra@company.com"})
+
+        account = resolver.resolve()[0]
+        assert account.email == "scoped@company.com"
+        assert account.api_key == "scoped-key"
+        assert account.site == "https://scoped.zulipchat.com"
+        assert account.dm_policy == "allowlist"
+
+    def test_unscoped_multiplexer_accepts_explicit_extra(self, monkeypatch):
+        """Directly injected config must not trigger a global-env read."""
+        scope = ModuleType("agent.secret_scope")
+        scope.current_secret_scope = lambda: None
+        scope.is_multiplex_active = lambda: True
+        scope.get_secret = lambda name, default=None: (_ for _ in ()).throw(
+            RuntimeError("must not read unscoped environment")
+        )
+        agent = ModuleType("agent")
+        agent.secret_scope = scope
+        monkeypatch.setitem(sys.modules, "agent", agent)
+        monkeypatch.setitem(sys.modules, "agent.secret_scope", scope)
+        monkeypatch.setenv("ZULIP_EMAIL", "global@company.com")
+
+        account = AccountResolver(extra={
+            "email": "configured@company.com",
+            "api_key": "configured-key",
+            "site": "https://configured.zulipchat.com",
+            "dm_policy": "disabled",
+        }).resolve()[0]
+        assert account.email == "configured@company.com"
+        assert account.api_key == "configured-key"
+        assert account.site == "https://configured.zulipchat.com"
+        assert account.dm_policy == "disabled"
 
 
 class TestMultiAccount:

@@ -10,6 +10,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Out-of-process delivery**: register a `standalone_sender_fn` (`_standalone_send`) on the Hermes `PlatformEntry` so `deliver: zulip[:<stream_id>[:<topic>]]` cron jobs can send when no gateway adapter is live in the calling process (`hermes cron run <job>`, cron in its own process). Previously such sends failed with `No live adapter for platform 'zulip'`. Supports streams (`<stream_id>`), DMs (`dm:<user_id>`), the `zulip:<stream>:<topic>` thread segment as topic, inline `[[zulip_topic: …]]` directives, `ZULIP_RESPONSE_PREFIX`, media uploads, and `ZULIP_SEND_TIMEOUT`.
 
 ### Fixed
+- **Multiplexed Hermes profiles**: Zulip adapters now resolve credentials and
+  behavior from Hermes' active profile secret scope, then snapshot them before
+  listener tasks start. Each profile now keeps separate Zulip clients, event
+  queues, dedupe state, policy allowlists, audit logs, media paths, and bot
+  workspaces. The primary adapter also carries its config-load snapshot through
+  Hermes' intentionally unscoped construction path, while missing scoped
+  secrets remain fail-closed instead of borrowing process-global credentials.
 - **Group direct-message replies**: preserve the complete Zulip private-message
   recipient set instead of replying only to the sender. When multiple bots are
   addressed in the same group DM, each bot now replies in that original group

@@ -21,6 +21,8 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from .runtime_scope import get_profile_data_dir, has_active_profile_scope
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_TTL_SECONDS = 3600  # 1 hour
@@ -37,7 +39,13 @@ class BotWorkspace:
         if root:
             self.root = Path(root).expanduser().resolve()
         else:
-            self.root = Path(tempfile.gettempdir()) / "hermes_bot_workspace"
+            # Preserve the standalone /tmp default. A Hermes profile scope,
+            # however, makes this data profile-owned and must not share files
+            # with another adapter in the same multiplexed process.
+            if has_active_profile_scope():
+                self.root = Path(get_profile_data_dir()) / "zulip_workspace"
+            else:
+                self.root = Path(tempfile.gettempdir()) / "hermes_bot_workspace"
         self.ttl = ttl
         self.root.mkdir(parents=True, exist_ok=True)
 

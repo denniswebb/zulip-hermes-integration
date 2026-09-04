@@ -10,7 +10,9 @@ Safe wrappers catch and log errors so a reaction failure never breaks the flow.
 
 import asyncio
 import logging
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
+
+from .runtime_scope import get_setting
 
 logger = logging.getLogger(__name__)
 
@@ -47,21 +49,25 @@ class ReactionConfig:
         return raw.strip().strip(":")
 
     @classmethod
-    def from_env(cls) -> "ReactionConfig":
-        """Build config from environment variables."""
-        import os
+    def from_env(cls, settings: Mapping[str, str] | None = None) -> "ReactionConfig":
+        """Build config from a scoped profile or legacy environment."""
 
         def truthy(val: str) -> bool:
             return val.lower() not in ("false", "0", "", "no", "off")
 
-        enabled = truthy(os.getenv("ZULIP_REACTIONS_ENABLED", "true"))
-        clear = truthy(os.getenv("ZULIP_REACTION_CLEAR_ON_FINISH", "true"))
+        def setting(name: str, default: str) -> str:
+            if settings is not None:
+                return settings.get(name) or default
+            return get_setting(name, default) or default
+
+        enabled = truthy(setting("ZULIP_REACTIONS_ENABLED", "true"))
+        clear = truthy(setting("ZULIP_REACTION_CLEAR_ON_FINISH", "true"))
         return cls(
             enabled=enabled,
             clear_on_finish=clear,
-            on_start=os.getenv("ZULIP_REACTION_START", DEFAULT_START),
-            on_success=os.getenv("ZULIP_REACTION_SUCCESS", DEFAULT_SUCCESS),
-            on_error=os.getenv("ZULIP_REACTION_ERROR", DEFAULT_ERROR),
+            on_start=setting("ZULIP_REACTION_START", DEFAULT_START),
+            on_success=setting("ZULIP_REACTION_SUCCESS", DEFAULT_SUCCESS),
+            on_error=setting("ZULIP_REACTION_ERROR", DEFAULT_ERROR),
         )
 
 
